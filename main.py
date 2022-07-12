@@ -1,15 +1,16 @@
+import argparse
 import json
 import os
 import sys
-import requests
+import requests # type: ignore
 import sqlite3
 import base64
 
-from lxml import etree
-from lxml.etree import _ElementTree, ElementBase
+from lxml import etree # type: ignore
+from lxml.etree import _ElementTree, ElementBase # type: ignore
 from io import StringIO
 from urllib.parse import urlparse
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import proto_pb2 as proto
 
@@ -101,14 +102,14 @@ class FavoritedGIF:
             print(f"[UNSUPPORTED URL] ({self.url_host})", self.sanitized_url)
             print()
 
-class DataNotLoadedError(Exception):
+class DataNotLoadedError(RuntimeError):
     def __init__(self) -> None:
         super().__init__("Data has not been loaded")
 
 class DataManager:
 
     def __init__(self, load: bool = True) -> None:
-        self._gif_list: List[dict] = None
+        self._gif_list: Optional[List[dict]] = None
 
         if load:
             self.load()
@@ -168,7 +169,7 @@ class DataManager:
 
     def deserialize_gifs(self) -> List[FavoritedGIF]:
         """Deserializes and returns a list of FavoritedGIF objects."""
-        return [FavoritedGIF(d) for d in self._gif_list]
+        return [FavoritedGIF(d) for d in self._gif_list or []]
 
     def serialize_gifs(self, gifs: List[FavoritedGIF]) -> List[dict]:
         """Serializes and returns a list of GIF dicts."""
@@ -180,6 +181,12 @@ class LocalStorageEntry:
 
     def __init__(self, data: Tuple[str, str, str]) -> None:
         self.origin_attributes, self.key, self.value = data
+        # Tries to fix strings which are '"saved with quotation marks"'
+        if self.value[0] == '"' and self.value[-1] == '"':
+            self.value = self.value[1:-1]
+
+    def __repr__(self) -> str:
+        return f'<LocalStorageEntry key="{self.key}" value="{self.value}">'
 
 class ProtoSettingsReader:
 
@@ -230,36 +237,42 @@ class ProtoSettingsReader:
 
 
 def main():
-    if len(sys.argv) > 2:
-        print("Too many args passed. If you want to fetch proto-settings, please pass your discord token")
-        exit(1)
+    parser = argparse.ArgumentParser("Discord favourite GIF downloader")
+    parser.add_argument("-t", "--token", help="Specifies Discord token, alternatively extracts one from Firefox automatically")
+    parser.add_argument('--localstorage', help="Tells the program to get favourite GIFs from Firefox's localstorage", dest="local", action='store_true')
+    parser.set_defaults(local=False)
+    args = parser.parse_args()
 
-    fetch_proto_settings = len(sys.argv) == 2
+    require_firefox_paths = args.token is None or args.local is True
 
-    # Initial value
+    # Only discover firefox paths when user requires it
+    if require_firefox_paths:
+
+        # Get profile paths
+        if os.name == "nt":
+            firefox_profiles_path = os.path.join(os.getenv('APPDATA'), "Mozilla", "Firefox", "Profiles")
+        else:
+            firefox_profiles_path = os.path.expanduser("~/.mozilla/firefox")
+
+        # Find specific profile path
+        # TODO: add some user input stuff
+        if os.name == 'nt':
+            firefox_profile_path = os.path.join(firefox_profiles_path, "gkouv51m.default-release")
+        else:
+            firefox_profile_path = os.path.join(firefox_profiles_path, "2kgd5r1z.default")
+
+        db_path = os.path.join(firefox_profile_path, "webappsstore.sqlite")
+        print("Accessing the database at:", db_path)
+    
+    # Initialize some managers and stuff
     manager = DataManager()
     gifs = []
 
-    # Fetch data from new API
-    if fetch_proto_settings:
-        r = requests.get("https://discord.com/api/v9/users/@me/settings-proto/2", headers={
-            "Authorization": sys.argv[1]
-        })
-        data = r.json()
-        if "settings" not in data:
-            print("Tried using token, but an error was encountered:", data["message"])
-            exit(100)
-
-        reader = ProtoSettingsReader(data["settings"])
-        manager.merge(reader.get_favorite_gifs())
-
-    # Use old school method
-    else:
-
+    # Stricly if user demands data from localstorage
+    if args.local:
+        print("Acquiring data from localstorage")
         # This is all purely for my use case, it uses Mozilla's localstorage DB
-        db = sqlite3.connect(
-            os.path.join(os.getenv('APPDATA'), "Mozilla\\Firefox\\Profiles\\lv99cc5z.default-release\\webappsstore.sqlite")
-        )
+        db = sqlite3.connect(db_path)
         cur = db.cursor()
         cur.execute(
             "SELECT originattributes, key, value "
@@ -275,7 +288,54 @@ def main():
                 data = json.loads(entry.value)
                 manager.merge(data["_state"]["favorites"])
                 break
+    
+    # Otherwise, strictly use tokens and the proto API for data
+    else:
+        print("Acquiring data from the API")
 
+        token: str = None
+        if args.token:
+            print("Token provided by a command line argument")
+            token = args.token
+        else:
+            print("Token not provided by a command line argument, extracting one from Firefox automatically")        
+
+            # Get data from a sqlite DB
+            db = sqlite3.connect(os.path.join(firefox_profile_path, "webappsstore.sqlite"), timeout=5)
+            cur = db.cursor()
+            cur.execute(
+                "SELECT originAttributes, key, value "
+                "FROM webappsstore2 "
+                "WHERE key = 'token' AND originKey = ?",
+
+                ("discord.com"[::-1] + ".:https:443",) # Firefox for some reason stores them flipped
+            ) 
+            entries = [LocalStorageEntry(r) for r in cur.fetchall()]
+            cur.close()
+            db.close()
+
+            # Deal with entries
+            if len(entries) == 0:
+                raise RuntimeError("Unable to find any discord tokens")
+            if len(entries) > 1:
+                # TODO: add user selection
+                raise RuntimeError("Multiple tokens have been found, I am bailing out. Are you running multi-account containers by any chance?")
+
+            token = entries[0].value
+
+        # Fetch data from new API
+        r = requests.get("https://discord.com/api/v9/users/@me/settings-proto/2", headers={
+            "Authorization": token
+        })
+        data = r.json()
+        if "settings" not in data:
+            raise RuntimeError(f"Tried using token, but an error was encountered:\n{data['message']}")
+
+        reader = ProtoSettingsReader(data["settings"])
+        manager.merge(reader.get_favorite_gifs())
+    
+
+    # Do the actual data clean-up
     gifs = manager.deserialize_gifs()
     if len(gifs) == 0:
         print("Failure: no GIFs were deserialized!")
