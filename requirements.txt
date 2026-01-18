@@ -1,3 +1,0 @@
-lxml
-requests
-protobuf==4.21.1
