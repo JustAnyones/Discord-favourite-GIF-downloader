@@ -1,16 +1,15 @@
-import argparse
+
 import json
+import argparse
 import os
-import sys
 import requests # type: ignore
-import sqlite3
 import base64
 
 from lxml import etree # type: ignore
 from lxml.etree import _ElementTree, ElementBase # type: ignore
 from io import StringIO
 from urllib.parse import urlparse
-from typing import List, Optional, Tuple
+from typing import Any
 
 import proto_pb2 as proto
 
@@ -18,13 +17,14 @@ HTML_PARSER = etree.HTMLParser()
 
 class FavoritedGIF:
 
-    def __init__(self, data: dict) -> None:
-        self.w = data["width"]
-        self.h = data["height"]
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.w: int = data["width"]
+        self.h: int = data["height"]
         self.src: str = data["src"]
         self.url: str = data["url"]
-        self.format = data["format"]
-        self.path: str = data.get("path", None)
+        self.format: str = data["format"]
+        self.path: str | None = data.get("path", None)
+        self.refreshed_url: str | None = data.get("refreshed_url", None)
 
     @property
     def url_host(self):
@@ -32,28 +32,32 @@ class FavoritedGIF:
 
     @property
     def sanitized_url(self):
-        url_comps = urlparse(self.url)
+        url = self.url
+        if self.refreshed_url is not None:
+            url = self.url
+        url_comps = urlparse(url)
         # If URL ends with an extension, it's safe to assume that parameters would not be useful
         if url_comps.path.endswith(".gif"):
             return f"{url_comps.scheme}://{url_comps.netloc}{url_comps.path}"
-        return self.url
+        return url
 
-    def serialize(self) -> dict:
+    def serialize(self) -> dict[str, Any]:
         return {
             "width": self.w,
             "height": self.h,
             "src": self.src,
             "url": self.url,
             "format": self.format,
-            "path": self.path
+            "path": self.path,
+            "refreshed_url": self.refreshed_url
         }
 
-    def _download_generic(self, url):
+    def _download_generic(self, url: str):
         # Create downloads path if it doesn't exist
         if not os.path.exists("downloads"):
             os.mkdir("downloads")
 
-        file_name = os.path.basename(url)
+        file_name = os.path.basename(self.sanitized_url)
         file_path = os.path.join("downloads", file_name)
 
         # Create file and make sure it doesn't duplicate
@@ -64,18 +68,25 @@ class FavoritedGIF:
             i += 1
 
         # Download the file
-        r = requests.get(url)
-        with open(file_path, mode="wb") as f:
-            f.write(r.content)
+        try:
+            r = requests.get(url)
+            with open(file_path, mode="wb") as f:
+                _ = f.write(r.content)
+            r.raise_for_status()
+        except Exception as e:
+            print(f"[ERROR] Failed to download {url}: {e}")
+            # remove the partially created file
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            return
 
         self.path = file_path
+        print(f"[DOWNLOADED] {url} (status: {r.status_code}) -> {self.path}")
 
-        print(f"[DOWNLOAD] {self.sanitized_url}")
-
-    def _extract_tenor_url(self, url):
+    def _extract_tenor_url(self, url: str) -> str:
         r = requests.get(url)
         tree: _ElementTree = etree.parse(StringIO(r.text), HTML_PARSER)
-        meta_tags: List[ElementBase] = tree.xpath("//meta")
+        meta_tags: list[ElementBase] = tree.xpath("//meta")
         for tag in meta_tags:
             if "itemprop" in tag.attrib:
                 if tag.attrib["itemprop"] == 'contentUrl':
@@ -85,13 +96,15 @@ class FavoritedGIF:
         if self.path is not None:
             return
 
+        url = self.refreshed_url or self.url
+
         # If URL ends with .gif, it's very likely it's a plain file
-        if self.sanitized_url.endswith(".gif"):
-            return self._download_generic(self.sanitized_url)
+        if os.path.basename(self.sanitized_url).endswith(".gif"):
+            return self._download_generic(url)
 
         # Handle tenor URLs
         if self.url_host == "tenor.com":
-            url = self._extract_tenor_url(self.sanitized_url)
+            url = self._extract_tenor_url(url)
             # Edge case where tenor gifs get removed
             if url is not None:
                 return self._download_generic(url)
@@ -99,7 +112,7 @@ class FavoritedGIF:
 
         else:
             print()
-            print(f"[UNSUPPORTED URL] ({self.url_host})", self.sanitized_url)
+            print(f"[UNSUPPORTED URL] ({self.url_host})", url)
             print()
 
 class DataNotLoadedError(RuntimeError):
@@ -109,7 +122,7 @@ class DataNotLoadedError(RuntimeError):
 class DataManager:
 
     def __init__(self, load: bool = True) -> None:
-        self._gif_list: Optional[List[dict]] = None
+        self._gif_list: list[dict] | None = None
 
         if load:
             self.load()
@@ -137,7 +150,7 @@ class DataManager:
         with open("data.json", mode="w") as f:
             json.dump(self._gif_list, f)
 
-    def merge(self, new_gif_list: List[dict]):
+    def merge(self, new_gif_list: list[dict]):
         """Merges 2 lists together.
 
         Note, this does not remove the old entries."""
@@ -167,26 +180,15 @@ class DataManager:
             print("[MERGE]", gif["url"])
             self._gif_list.append(gif)
 
-    def deserialize_gifs(self) -> List[FavoritedGIF]:
+    def deserialize_gifs(self) -> list[FavoritedGIF]:
         """Deserializes and returns a list of FavoritedGIF objects."""
         return [FavoritedGIF(d) for d in self._gif_list or []]
 
-    def serialize_gifs(self, gifs: List[FavoritedGIF]) -> List[dict]:
+    def serialize_gifs(self, gifs: list[FavoritedGIF]) -> list[dict]:
         """Serializes and returns a list of GIF dicts."""
         self._gif_list = [gif.serialize() for gif in gifs]
         return self.data
 
-
-class LocalStorageEntry:
-
-    def __init__(self, data: Tuple[str, str, str]) -> None:
-        self.origin_attributes, self.key, self.value = data
-        # Tries to fix strings which are '"saved with quotation marks"'
-        if self.value[0] == '"' and self.value[-1] == '"':
-            self.value = self.value[1:-1]
-
-    def __repr__(self) -> str:
-        return f'<LocalStorageEntry key="{self.key}" value="{self.value}">'
 
 class ProtoSettingsReader:
 
@@ -203,7 +205,7 @@ class ProtoSettingsReader:
     # this data. Other methods exist just so I can do the pro-grammer
     # move of just copy pasting this class in my other projects,
     # just in case I ever need it :)
-    def get_favorite_gifs(self) -> List[dict]:
+    def get_favorite_gifs(self) -> list[dict]:
         """Returns a dictionary list of favorite gifs.
         Note: list is not guaranteed to be in the same order every time."""
         gifs = []
@@ -215,7 +217,7 @@ class ProtoSettingsReader:
                 "height": mapping.height,
                 "src": mapping.src,
                 "url": key,
-                "format": "VIDEO" if mapping.format == 2 else "IMAGE"
+                "format": "VIDEO" if mapping.format == 2 else "IMAGE",
             }
             gifs.append(gif_dict)
         return gifs
@@ -238,101 +240,27 @@ class ProtoSettingsReader:
 
 def main():
     parser = argparse.ArgumentParser("Discord favourite GIF downloader")
-    parser.add_argument("-t", "--token", help="Specifies Discord token, alternatively extracts one from Firefox automatically")
-    parser.add_argument('--localstorage', help="Tells the program to get favourite GIFs from Firefox's localstorage", dest="local", action='store_true')
-    parser.set_defaults(local=False)
+    parser.add_argument("-t", "--token", help="Specifies Discord token", required=True)
     args = parser.parse_args()
-
-    require_firefox_paths = args.token is None or args.local is True
-
-    # Only discover firefox paths when user requires it
-    if require_firefox_paths:
-
-        # Get profile paths
-        if os.name == "nt":
-            firefox_profiles_path = os.path.join(os.getenv('APPDATA'), "Mozilla", "Firefox", "Profiles")
-        else:
-            firefox_profiles_path = os.path.expanduser("~/.mozilla/firefox")
-
-        # Find specific profile path
-        # TODO: add some user input stuff
-        if os.name == 'nt':
-            firefox_profile_path = os.path.join(firefox_profiles_path, "gkouv51m.default-release")
-        else:
-            firefox_profile_path = os.path.join(firefox_profiles_path, "2kgd5r1z.default")
-
-        db_path = os.path.join(firefox_profile_path, "webappsstore.sqlite")
-        print("Accessing the database at:", db_path)
     
     # Initialize some managers and stuff
     manager = DataManager()
     gifs = []
 
-    # Stricly if user demands data from localstorage
-    if args.local:
-        print("Acquiring data from localstorage")
-        # This is all purely for my use case, it uses Mozilla's localstorage DB
-        db = sqlite3.connect(db_path)
-        cur = db.cursor()
-        cur.execute(
-            "SELECT originattributes, key, value "
-            "FROM webappsstore2 "
-            "WHERE originattributes LIKE '%firstPartyDomain=discord.com' AND `key` = 'GIFFavoritesStore'"
-        )
-        entries = [LocalStorageEntry(t) for t in cur.fetchall()]
 
-        for entry in entries:
+    print("Acquiring data from the API")
+    token: str = args.token
 
-            # Get the correct item, userContextId=1 is from containers, this one refers to my personal one
-            if 'userContextId=1' in entry.origin_attributes:
-                data = json.loads(entry.value)
-                manager.merge(data["_state"]["favorites"])
-                break
-    
-    # Otherwise, strictly use tokens and the proto API for data
-    else:
-        print("Acquiring data from the API")
+    # Fetch data from new API
+    r = requests.get("https://discord.com/api/v9/users/@me/settings-proto/2", headers={
+        "Authorization": token
+    })
+    data: dict[str, Any] = r.json()
+    if "settings" not in data:
+        raise RuntimeError(f"Tried using token, but an error was encountered:\n{data['message']}")
 
-        token: str = None
-        if args.token:
-            print("Token provided by a command line argument")
-            token = args.token
-        else:
-            print("Token not provided by a command line argument, extracting one from Firefox automatically")        
-
-            # Get data from a sqlite DB
-            db = sqlite3.connect(os.path.join(firefox_profile_path, "webappsstore.sqlite"), timeout=5)
-            cur = db.cursor()
-            cur.execute(
-                "SELECT originAttributes, key, value "
-                "FROM webappsstore2 "
-                "WHERE key = 'token' AND originKey = ?",
-
-                ("discord.com"[::-1] + ".:https:443",) # Firefox for some reason stores them flipped
-            ) 
-            entries = [LocalStorageEntry(r) for r in cur.fetchall()]
-            cur.close()
-            db.close()
-
-            # Deal with entries
-            if len(entries) == 0:
-                raise RuntimeError("Unable to find any discord tokens")
-            if len(entries) > 1:
-                # TODO: add user selection
-                raise RuntimeError("Multiple tokens have been found, I am bailing out. Are you running multi-account containers by any chance?")
-
-            token = entries[0].value
-
-        # Fetch data from new API
-        r = requests.get("https://discord.com/api/v9/users/@me/settings-proto/2", headers={
-            "Authorization": token
-        })
-        data = r.json()
-        if "settings" not in data:
-            raise RuntimeError(f"Tried using token, but an error was encountered:\n{data['message']}")
-
-        reader = ProtoSettingsReader(data["settings"])
-        manager.merge(reader.get_favorite_gifs())
+    reader = ProtoSettingsReader(data["settings"])
+    manager.merge(reader.get_favorite_gifs())
     
 
     # Do the actual data clean-up
@@ -341,8 +269,44 @@ def main():
         print("Failure: no GIFs were deserialized!")
         exit(2)
 
-    for gif in gifs:
-        gif.download()
+    urls_to_refresh: list[tuple[int, str]] = []
+    for i, gif in enumerate(gifs):
+        if ("media.discordapp.net" in (gif.url_host or "discord") \
+            or "cdn.discordapp.net" in (gif.url_host or "discord"))\
+            and gif.refreshed_url is None:
+            print("[SKIP DISCORD GIF]", gif.url, gif.refreshed_url)
+            urls_to_refresh.append((i, gif.url))
+            continue
+        try:
+            gif.download()
+        except Exception as e:
+            print(f"[ERROR] Failed to download {gif.sanitized_url}: {e}")
+
+
+    # Refresh Discord URLs
+    refreshed_urls: list[tuple[int, str]] = []
+    for i in range(0, len(urls_to_refresh), 50):
+        batch = urls_to_refresh[i:i+50]
+        r = requests.post(
+            "https://discord.com/api/v9/attachments/refresh-urls",
+            json={
+                "attachment_urls": [url for _, url in batch]
+            },
+            headers={
+                "Authorization": token,
+                "Content-Type": "application/json"
+            }
+        )
+        if r.status_code != 200:
+            print(f"[ERROR] Failed to refresh URL batch starting at index {i}: {r.status_code} {r.text}")
+            continue
+        resp_json = r.json()
+        for j, refreshed_url in enumerate(resp_json["refreshed_urls"]):
+            refreshed_urls.append((batch[j][0], refreshed_url["refreshed"]))
+    # Apply refreshed URLs
+    for index, new_url in refreshed_urls:
+        gifs[index].refreshed_url = new_url
+    print(f"{len(refreshed_urls)} URLs refreshed.")
 
     manager.serialize_gifs(gifs)
     manager.save()
